@@ -23,6 +23,26 @@ MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kelvin Cao");
 
+static char *thresh_policy = "";
+module_param(thresh_policy, charp, 0644);
+MODULE_PARM_DESC(thresh_policy, "<thresh-policy>\n"
+		"                Syntax: <thresh>@<channel-index>[,<threshx>@<channel-a>,...]\n"
+		"                e.g. s@1,d@2,6@5\n"
+		"                s@1 => apply Static configuration value for channel 1 SE Threshold\n"
+		"                d@2 => setup Default configuration value for channel 1 SE Threshold(=SE_Buf_len/2)\n"
+		"                6@5 => set threshold value as 6 for channel 5channel 1 SE Threshold\n"
+		"                NOTE: Channel index not specified in the list will be setup with Default configuration value(=SE_Buf_len/2)"
+);
+
+struct ch_thresh_s {
+    int ch_idx; /*Channel index*/
+    u32 thresh; /*Threshold value*/
+    unsigned char policy; /*Threshold policy 'd' or 's' or 'c'*/
+};
+
+static struct ch_thresh_s *thresh_kv_arr = NULL;
+static int thresh_kvp_count = 0;
+
 enum switchtec_reg_offset {
 	SWITCHTEC_DMAC_VERSION_OFFSET = 0,
 	SWITCHTEC_DMAC_CAPABILITY_OFFSET = 0x80,
@@ -433,6 +453,57 @@ struct switchtec_dma_desc {
 	u32 orig_size;
 	bool completed;
 };
+
+static int setup_thresh_policy(struct pci_dev *pdev)
+{
+	char *ptr;
+	int i = 0;
+	struct device *dev = &pdev->dev;
+
+	if (!strlen(thresh_policy)) {
+		dev_info(dev, "Default SE Threshold for all channels\n");
+		return 0;
+	}
+
+	/*Get number of policy key-value pairs*/
+	ptr = thresh_policy;
+	thresh_kvp_count = 1;
+	while ((ptr = strstr(ptr, ",")) != NULL) {
+		thresh_kvp_count++;
+		ptr++;
+	}
+
+	/*Allocate array for given policy entries*/
+	thresh_kv_arr = kmalloc_array(thresh_kvp_count,
+			sizeof(struct ch_thresh_s),
+			GFP_KERNEL);
+	if (!thresh_kv_arr) {
+		dev_info(dev, "Threshold array alloc failed\n");
+		return -ENOMEM;
+	}
+
+	/*Parse the policy input*/
+	ptr = thresh_policy;
+	do {
+		if(*ptr == ',') ptr++;
+		if (sscanf(ptr, "%d@%d",
+					&thresh_kv_arr[i].thresh,
+					&thresh_kv_arr[i].ch_idx) == 2) {
+			thresh_kv_arr[i].policy = 'c'; /*User customized value*/
+		} else if (sscanf(ptr, "%c@%d",
+					&thresh_kv_arr[i].policy,
+					&thresh_kv_arr[i].ch_idx) != 2) {
+			dev_err(dev, "Bad thresh_policy syntax: %s\n",
+					thresh_policy);
+			kfree(thresh_kv_arr);
+			thresh_kv_arr = NULL;
+			return -EINVAL;
+		}
+		i++;
+	} while ((ptr = strstr(ptr+1, ",")) != NULL);
+
+	return 0;
+}
 
 #define HALT_RETRY 100
 static int halt_channel(struct switchtec_dma_chan *swdma_chan)
@@ -1383,6 +1454,11 @@ static void switchtec_dma_free_chan_resources(struct dma_chan *chan)
 
 static struct kobj_type switchtec_config_ktype;
 
+#define SE_THRESH_STATIC  0x00
+#define SE_THRESH_DEFAULT 0x01
+#define SE_THRESH_NEW_VAL 0x02
+#define SE_THRESH_SET_REG 0x04
+
 static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 {
 	struct dma_device *dma = &swdma_dev->dma_dev;
@@ -1399,6 +1475,9 @@ static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 	int irq;
 	int rc = 0;
 	size_t offset;
+	u32 orig_thresh;
+	int j;
+	int thresh_ctrl = SE_THRESH_DEFAULT;
 
 	rcu_read_lock();
 	pdev = rcu_dereference(swdma_dev->pdev);
@@ -1455,9 +1534,48 @@ static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 	se_buf_len = (valid_en_se >> SE_BUF_LEN_SHIFT) & SE_BUF_LEN_MASK;
 	dev_dbg(dev, "Channel %d: SE buffer count %d\n", i, se_buf_len);
 
-	thresh = se_buf_len / 2;
-	valid_en_se |= (thresh & SE_THRESH_MASK) << SE_THRESH_SHIFT;
-	writel(valid_en_se , &chan_fw->valid_en_se);
+	if (strlen(thresh_policy) > 0) {
+		for (j = 0; j < thresh_kvp_count; j++) {
+			if (thresh_kv_arr[j].ch_idx == i) {
+				switch (thresh_kv_arr[j].policy) {
+					case 'c': /*Custom thresh value for this channel*/
+						orig_thresh = (valid_en_se >> SE_THRESH_SHIFT) &
+							SE_THRESH_MASK;
+						thresh = thresh_kv_arr[j].thresh;
+						thresh_ctrl = SE_THRESH_NEW_VAL|SE_THRESH_SET_REG;
+						break;
+					case 's': /*leave threshold as-is*/
+						thresh_ctrl = SE_THRESH_STATIC;
+						break;
+					case 'd': /*use default policy*/
+					default:
+						break;
+				}
+				break;
+			}
+		}
+		/* j==thresh_kvp_count => No thresh policy chosen.
+		 * So thresh will still be default */
+	}
+
+	if (thresh_ctrl & SE_THRESH_DEFAULT) { /*ensure thresh<buflen*/
+		thresh = (valid_en_se >> SE_THRESH_SHIFT) & SE_THRESH_MASK;
+		if (thresh >= se_buf_len) {
+			orig_thresh = thresh;
+			thresh = (se_buf_len >= 6) ? (se_buf_len / 2) : 3 ;
+			thresh_ctrl |= SE_THRESH_SET_REG;
+		}
+	}
+
+	if (thresh_ctrl & SE_THRESH_SET_REG) { /*update DMAC register*/
+		dev_info(dev, "Channel %d: Threshold orig=%u, %s=%u\n",
+				i, orig_thresh,
+				(thresh_ctrl & SE_THRESH_NEW_VAL) ? "new":"corrected",
+				thresh);
+		valid_en_se &= ~(SE_THRESH_MASK << SE_THRESH_SHIFT);
+		valid_en_se |= (thresh & SE_THRESH_MASK) << SE_THRESH_SHIFT;
+		writel(valid_en_se, &chan_fw->valid_en_se);
+	}
 
 	/* request irqs */
 	irq = readl(&chan_fw->int_vec);
@@ -3180,6 +3298,10 @@ static int switchtec_dma_probe(struct pci_dev *pdev,
 
 	pci_set_master(pdev);
 
+	rc = setup_thresh_policy(pdev);
+	if (rc)
+		goto err_free_irq_vectors;
+
 	rc = switchtec_dma_create(pdev, id->driver_data);
 	if (rc)
 		goto err_free_irq_vectors;
@@ -3189,6 +3311,7 @@ static int switchtec_dma_probe(struct pci_dev *pdev,
 	return 0;
 
 err_free_irq_vectors:
+	kfree(thresh_kv_arr);
 	pci_free_irq_vectors(pdev);
 
 err_disable:
@@ -3224,6 +3347,8 @@ static void switchtec_dma_remove(struct pci_dev *pdev)
 
 	dma_async_device_unregister(&swdma_dev->dma_dev);
 	put_device(swdma_dev->dma_dev.dev);
+
+	kfree(thresh_kv_arr);
 
 	pci_info(pdev, "Switchtec DMA Channels Unregistered\n");
 }

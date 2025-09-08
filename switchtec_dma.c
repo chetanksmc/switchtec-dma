@@ -24,10 +24,10 @@ MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kelvin Cao");
 
-static char *thresh_policy = "";
-module_param(thresh_policy, charp, 0644);
-MODULE_PARM_DESC(thresh_policy, "<thresh-policy>\n"
-		"                Syntax: <thresh>@<channel-index>[,<threshx>@<channel-a>,...]\n"
+static char *se_thresh_policy = "";
+module_param(se_thresh_policy, charp, 0644);
+MODULE_PARM_DESC(se_thresh_policy, "<thresh-policy>\n"
+		"                Syntax: <se_threshold>@<channel-index>[,<se_thresholdx>@<channel-a>,...]\n"
 		"                e.g. s@1,d@2,6@5\n"
 		"                s@1 => apply Static configuration value for channel 1 SE Threshold\n"
 		"                d@2 => setup Default configuration value for channel 2 SE Threshold(=SE_Buf_len/2)\n"
@@ -461,20 +461,20 @@ static int setup_thresh_policy(struct pci_dev *pdev)
 	int i, j, ch_idx, thresh;
 	struct device *dev = &pdev->dev;
 
-	if (!strlen(thresh_policy)) {
+	if (!strlen(se_thresh_policy)) {
 		dev_info(dev, "Default SE Threshold for all channels\n");
 		return 0;
 	}
 
 	/*Get number of policy key-value pairs*/
-	kptr = thresh_policy;
+	kptr = se_thresh_policy;
 	while ((kptr = strchr(kptr, '@')) != NULL) {
 		thresh_kvp_count++;
 		kptr++;
 	}
 	if (thresh_kvp_count == 0)
 		goto err_thresh_policy_parsing;
-	copy = kstrdup(thresh_policy, GFP_KERNEL);
+	copy = kstrdup(se_thresh_policy, GFP_KERNEL);
 	if (!copy) {
 		dev_info(dev, "Threshold array alloc failed\n");
 		return -ENOMEM;
@@ -523,7 +523,7 @@ static int setup_thresh_policy(struct pci_dev *pdev)
 			if (thresh_kv_arr[j].ch_idx == ch_idx)
 				goto err_thresh_policy_parsing;
 
-		dev_err(dev, "thresh_policy ch=%d, policy=%c, thresh=%d\n",
+		dev_err(dev, "se_thresh_policy ch=%d, policy=%c, thresh=%d\n",
 				ch_idx, policy, thresh);
 		thresh_kv_arr[i].policy = policy;
 		thresh_kv_arr[i].ch_idx = ch_idx;
@@ -536,7 +536,7 @@ static int setup_thresh_policy(struct pci_dev *pdev)
 
 err_thresh_policy_parsing:
 	kfree(copy);
-	dev_err(dev, "Bad thresh_policy syntax: %s\n", thresh_policy);
+	dev_err(dev, "Bad se_thresh_policy syntax: %s\n", se_thresh_policy);
 	return -EINVAL;
 }
 
@@ -1569,7 +1569,7 @@ static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 	se_buf_len = (valid_en_se >> SE_BUF_LEN_SHIFT) & SE_BUF_LEN_MASK;
 	dev_dbg(dev, "Channel %d: SE buffer count %d\n", i, se_buf_len);
 
-	if (strlen(thresh_policy) > 0) {
+	if (strlen(se_thresh_policy) > 0) {
 		for (j = 0; j < thresh_kvp_count; j++) {
 			if (thresh_kv_arr[j].ch_idx == i) {
 				switch (thresh_kv_arr[j].policy) {

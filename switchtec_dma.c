@@ -523,7 +523,7 @@ static int setup_thresh_policy(struct pci_dev *pdev)
 			if (thresh_kv_arr[j].ch_idx == ch_idx)
 				goto err_thresh_policy_parsing;
 
-		dev_err(dev, "se_thresh_policy ch=%d, policy=%c, thresh=%d\n",
+		dev_dbg(dev, "se_thresh_policy ch=%d, policy=%c, thresh=%d\n",
 				ch_idx, policy, thresh);
 		thresh_kv_arr[i].policy = policy;
 		thresh_kv_arr[i].ch_idx = ch_idx;
@@ -535,7 +535,8 @@ static int setup_thresh_policy(struct pci_dev *pdev)
 	return 0;
 
 err_thresh_policy_parsing:
-	kfree(copy);
+	if (copy)
+		kfree(copy);
 	dev_err(dev, "Bad se_thresh_policy syntax: %s\n", se_thresh_policy);
 	return -EINVAL;
 }

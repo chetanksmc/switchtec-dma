@@ -23,6 +23,17 @@ MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kelvin Cao");
 
+static char *se_thresh_policy = "";
+module_param(se_thresh_policy, charp, 0644);
+MODULE_PARM_DESC(se_thresh_policy, "<thresh-policy>\n"
+		"                Syntax: <se_threshold>@<channel-index>[,<se_thresholdx>@<channel-a>,...]\n"
+		"                e.g. c@1,d@2,6@5\n"
+		"                c@1 => 'config' policy - use previously configured threshold value for channel 1\n"
+		"                d@2 => 'driver' policy - ensure threshold value is less than se_buf_len for channel 2\n"
+		"                6@5 => 'user' policy - set user-provided threshold value 6 for channel 5\n"
+		"                NOTE: Unspecified channels use driver policy"
+);
+
 enum switchtec_reg_offset {
 	SWITCHTEC_DMAC_VERSION_OFFSET = 0,
 	SWITCHTEC_DMAC_CAPABILITY_OFFSET = 0x80,
@@ -1383,6 +1394,51 @@ static void switchtec_dma_free_chan_resources(struct dma_chan *chan)
 
 static struct kobj_type switchtec_config_ktype;
 
+static int switchtec_dma_get_ch_thresh(int ch_idx, u32 *thresh, char *policy)
+{
+	char *key, *val;
+	char sub[10] = "";
+
+	sprintf(sub, "@%d", ch_idx);
+	val = strstr(se_thresh_policy, sub);
+	if (!val) {
+		*policy = 'd';
+		return 0;
+	}
+
+	if (((val[strlen(sub)] != ',') && (val[strlen(sub)] != '\0')) ||
+			(val == se_thresh_policy))
+		return -1;
+
+	for (key = val - 1; ; key--) {
+		if ((*key == '@') || (*key == ',')) {
+			key++;
+			if (key == val)
+				return -1;
+			break;
+		}
+		if (key == se_thresh_policy)
+			break;
+	}
+	memcpy(sub, key, val - key);
+	sub[val - key] = '\0';
+	if (!kstrtoint(sub, 0, thresh) && (*thresh >= 0)) {
+		*policy = 'u';
+	} else {
+		if ((strlen(sub) != 1) || ((sub[0] != 'c') && (sub[0] != 'd')))
+			return -1;
+		*policy = sub[0];
+		*thresh = 0;
+	}
+
+	return 0;
+}
+
+#define SE_THRESH_CONFIG  0x00
+#define SE_THRESH_DRIVER  0x01
+#define SE_THRESH_NEW_VAL 0x02
+#define SE_THRESH_SET_REG 0x04
+
 static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 {
 	struct dma_device *dma = &swdma_dev->dma_dev;
@@ -1395,10 +1451,13 @@ static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 	u32 perf_cfg = 0;
 	u32 valid_en_se;
 	u32 thresh;
+	char policy;
 	int se_buf_len;
 	int irq;
 	int rc = 0;
 	size_t offset;
+	u32 orig_thresh;
+	int thresh_ctrl = SE_THRESH_DRIVER;
 
 	rcu_read_lock();
 	pdev = rcu_dereference(swdma_dev->pdev);
@@ -1455,9 +1514,45 @@ static int switchtec_dma_chan_init(struct switchtec_dma_dev *swdma_dev, int i)
 	se_buf_len = (valid_en_se >> SE_BUF_LEN_SHIFT) & SE_BUF_LEN_MASK;
 	dev_dbg(dev, "Channel %d: SE buffer count %d\n", i, se_buf_len);
 
-	thresh = se_buf_len / 2;
-	valid_en_se |= (thresh & SE_THRESH_MASK) << SE_THRESH_SHIFT;
-	writel(valid_en_se , &chan_fw->valid_en_se);
+	/* Use se_thresh_policy to set threshold in HW as per policy detected */
+	if (strlen(se_thresh_policy) > 0) {
+		if (switchtec_dma_get_ch_thresh(i, &thresh, &policy)) {
+			dev_err(dev, "Invalid se_thresh_policy: %s\n", se_thresh_policy);
+			return -EINVAL;
+		}
+		switch (policy) {
+		case 'u':
+			orig_thresh = (valid_en_se >> SE_THRESH_SHIFT) & SE_THRESH_MASK;
+			if (thresh != orig_thresh)
+				thresh_ctrl = SE_THRESH_NEW_VAL | SE_THRESH_SET_REG;
+			else
+				thresh_ctrl = SE_THRESH_CONFIG;
+			break;
+		case 'c':
+			thresh_ctrl = SE_THRESH_CONFIG;
+			break;
+		case 'd':
+		default:
+			break;
+		}
+	}
+	if (thresh_ctrl & SE_THRESH_DRIVER) {
+		thresh = (valid_en_se >> SE_THRESH_SHIFT) & SE_THRESH_MASK;
+		if (thresh >= se_buf_len) {
+			orig_thresh = thresh;
+			thresh = (se_buf_len > 6) ? (se_buf_len / 2) : 3 ;
+			thresh_ctrl |= SE_THRESH_SET_REG;
+		}
+	}
+	if (thresh_ctrl & SE_THRESH_SET_REG) {
+		dev_info(dev, "Channel %d: Threshold orig=%u, %s=%u\n",
+				i, orig_thresh,
+				(thresh_ctrl & SE_THRESH_NEW_VAL) ? "new" : "corrected",
+				thresh);
+		valid_en_se &= ~(SE_THRESH_MASK << SE_THRESH_SHIFT);
+		valid_en_se |= (thresh & SE_THRESH_MASK) << SE_THRESH_SHIFT;
+		writel(valid_en_se, &chan_fw->valid_en_se);
+	}
 
 	/* request irqs */
 	irq = readl(&chan_fw->int_vec);
